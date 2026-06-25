@@ -1,0 +1,342 @@
+================================================================================
+ANALYTICS – DATA SOURCES, FORMULAS, AND WHY SOME CHARTS LOOK EMPTY
+================================================================================
+Internal reference. Do NOT show to the client. Plain language so anyone on the
+team can answer "where does this number come from?" during a demo.
+
+This file documents every KPI and chart on the "Analytics" screen of the
+frontend (`/analytics`), the backend endpoint that feeds it, the SQL/Python
+that computes it, and the conditions under which the value can legitimately be
+empty / zero / "—".
+
+--------------------------------------------------------------------------------
+0. THE PIPELINE IN ONE PAGE
+--------------------------------------------------------------------------------
+
+1.  Source of truth: the PostgreSQL database used by `g-unity-benchmark-backend`.
+    Two tables matter for Analytics:
+      - `posts`              (raw scraped posts from Reddit, forums, etc.)
+      - `analyzed_posts`     (the same posts after NLP/scoring; this is what
+                              the dashboard service `dashboardService` consumes
+                              and what Analytics also normalizes on top of)
+
+2.  The backend module `app/modules/analytics/posts_aggregate.py` loads every
+    relevant post into a normalized Python dict with these fields:
+      - engine            ("unity" | "unreal" | "godot" | "other")
+      - platform          (e.g. "reddit", "stackoverflow", "twitter"…)
+      - created_at        (timestamp, used for trend bucketing)
+      - sentiment         (float in [-1, 1] when scored, else None)
+      - promoter_score    (0–10) and detractor_score (0–10) when available
+      - churn_risk        (0–100, from the dashboard scoring layer)
+      - bug_categories    (list of issue tags such as "performance", "ui"…)
+      - strategic_pillar  (one of: Product, Finance, Ecosystem, Positioning,
+                           or null when it's a generic post)
+      - title / summary_text / metadata (used for keyword fall-back filtering)
+
+3.  Every analytics endpoint accepts an optional `business=` query parameter
+    (sent by the strategic-pillar filter in the header). It maps:
+
+        Header label   →   API value
+        General        →   (no filter, all posts)
+        Product        →   Product
+        Finance        →   Finance
+        Ecosystem      →   Ecosystem
+        Positioning    →   Positioning
+
+    `filter_posts_for_strategic_pillar(posts, business)` keeps a post when:
+      (a) its `metadata.strategic_pillar` / `pillar` / `business_theme` equals
+          the selected pillar, OR
+      (b) when metadata is missing, a small keyword whitelist matches the
+          post's title / summary / bug_categories (e.g. "performance" → Product,
+          "pricing" / "license" → Finance, "asset store" → Ecosystem,
+          "competitor" / "market share" → Positioning).
+
+    So filtering NEVER invents numbers — it just narrows the input set. If a
+    pillar has zero matching posts, the endpoint legitimately returns empty
+    series.
+
+4.  The frontend (`useAnalyticsData.ts`) issues one TanStack-Query call per
+    endpoint and renders the raw response. There is no client-side recomputation
+    (the previous `analyticsPillarLens` helper was removed because it was
+    transforming numbers on the client).
+
+--------------------------------------------------------------------------------
+1. DASHBOARD KPI CARDS  (top of the Analytics page)
+--------------------------------------------------------------------------------
+
+Endpoint:     GET /api/analytics/summary?business=<pillar>
+Backend file: app/modules/analytics/summary.py
+              → app/modules/analytics/posts_aggregate.py
+                  function: build_analytics_summary_from_posts(posts)
+
+Each card on the dashboard is one item of the JSON array returned by /summary.
+The card shows:
+  - value            (already formatted by the backend, e.g. "62.4%", "8.1/10")
+  - label            (KPI name)
+  - change           ("+1.4%", "-0.3 pts", "—" if there is no prior period)
+  - trend            ("positive" | "negative" | "neutral") → drives the colour
+  - formula          (kept internal now; reproduced below)
+
+Below are the five KPIs we ship today.
+
+------------------------------------------------------------
+1.1  Unity market share
+------------------------------------------------------------
+What it answers:  "Of all posts mentioning a game engine in the current
+                   window, what % mention Unity?"
+
+Formula:
+    unity_share = (posts whose engine == "unity") /
+                  (posts whose engine in {"unity","unreal","godot","other"})
+                  × 100
+
+Comparison:       Same calculation on the immediately previous window of equal
+                  length. `change` is the difference in percentage points.
+Window:           Last 90 days of `created_at`, configurable in the backend.
+Why it can read 0% / "—":
+    - The selected pillar has no posts in the last 90 days.
+    - All matching posts are tagged engine = "other".
+
+------------------------------------------------------------
+1.2  Developer satisfaction (Unity)
+------------------------------------------------------------
+What it answers:  Average satisfaction expressed as a 0–10 score for Unity.
+
+Formula:
+    sat_unity = mean( promoter_score - detractor_score
+                      ) on Unity posts that have at least one of the two scores
+    Result is mapped to 0–10 (the backend stores it as 0–10 directly when the
+    NLP pipeline produced both scores, otherwise sentiment×5+5 is used as a
+    fall-back).
+
+Why it can read "—":
+    - No Unity post in the filtered window has promoter/detractor or sentiment
+      values. This happens with very small datasets or when the chosen pillar
+      filters out the only scored posts.
+
+------------------------------------------------------------
+1.3  Sentiment gap vs Unreal
+------------------------------------------------------------
+What it answers:  How far Unity sits below (or above) Unreal in average
+                  satisfaction.
+
+Formula:
+    gap = sat_unity − sat_unreal   (in 0–10 points)
+    Trend = "negative" if gap < 0, "positive" if gap > 0, "neutral" if |gap|<0.1
+
+Why it can read 0 / "—":
+    - One of the two engines has no scored posts in the window.
+
+------------------------------------------------------------
+1.4  Churn-risk pressure
+------------------------------------------------------------
+What it answers:  Average churn-risk score on Unity posts (0–100, higher is
+                  worse). Comes from the same scoring layer the Dashboard uses.
+
+Formula:
+    churn_pressure = mean( churn_risk ) over Unity posts whose churn_risk is not
+                     null.
+    Trend = "positive" when the value drops vs the previous window,
+            "negative" when it climbs.
+
+Why it can read "—":
+    - `churn_risk` is populated by the dashboard analyzer. Posts created before
+      that layer ran will not have it. Also: small filter buckets may contain
+      zero scored posts.
+
+------------------------------------------------------------
+1.5  Conversation volume
+------------------------------------------------------------
+What it answers:  How many posts the filter is looking at right now.
+
+Formula:
+    volume = COUNT(posts) after the pillar filter, in the current window.
+    `change` compares against the previous window of equal length.
+
+Why it can read 0:
+    - The selected pillar legitimately has zero posts in the window. This is
+      the most common reason the rest of the dashboard looks empty: if volume
+      is 0 every chart below will also be empty.
+
+--------------------------------------------------------------------------------
+2. MARKET SHARE TREND   (line chart, top-left of the chart grid)
+--------------------------------------------------------------------------------
+
+Endpoint:   GET /api/analytics/market-share-trend?business=<pillar>
+Computed in: get_market_share_trend_from_posts()
+
+Bucketing:  Calendar quarter (`YYYY-Qn`) using `created_at`.
+Series:     For every quarter the API returns
+                { period, unity, unreal, godot, other }
+            where each engine value is the % of posts of that engine within
+            that quarter (after the pillar filter).
+
+Identity:   unity + unreal + godot + other = 100 for every quarter that has
+            at least one post.
+
+Why a line can look flat or missing:
+    - A quarter with no matching posts is simply omitted from the array.
+    - If only one engine has posts in a pillar, its line will sit at 100 and
+      the others at 0. That is correct, not a bug.
+
+--------------------------------------------------------------------------------
+3. ENGINE SATISFACTION BY YEAR   (bar chart)
+--------------------------------------------------------------------------------
+
+Endpoint:   GET /api/analytics/developer-satisfaction?business=<pillar>
+Computed in: get_developer_satisfaction_from_posts()
+
+Bucketing:  Calendar year of `created_at`.
+For every (year, engine) pair:
+    score = mean( promoter_score − detractor_score )  on posts that have those
+            two scores. If only sentiment is available, score = sentiment×5+5.
+    The bar is omitted when there are < MIN_POSTS_FOR_SATISFACTION (default 3)
+    scored posts that year.
+
+Why bars can be missing:
+    - Fewer than 3 scored posts for that (engine, year). It is intentional –
+      we prefer hiding the bar to drawing one based on 1 post.
+
+--------------------------------------------------------------------------------
+4. SHARE VS SATISFACTION   (scatter)
+--------------------------------------------------------------------------------
+
+Endpoint:   GET /api/analytics/market-share-vs-developer-satisfaction
+            ?business=<pillar>
+Computed in: get_market_share_vs_developer_satisfaction_from_posts()
+
+For each engine in {Unity, Unreal, Godot, Other}:
+    share        = % of posts in the window (same formula as KPI 1.1, per engine)
+    satisfaction = mean satisfaction 0–10 across all scored posts of that engine
+    benchmark    = mean satisfaction across all scored posts of ALL engines
+
+The frontend draws Unity in red whenever its `satisfaction < benchmark`.
+
+Why a dot can be missing:
+    - An engine has zero scored posts → satisfaction is null → it is not
+      plotted (we filter `typeof satisfaction === 'number'` on the client).
+
+--------------------------------------------------------------------------------
+5. SATISFACTION BY THEME   (grouped bar chart)
+--------------------------------------------------------------------------------
+
+Endpoint:   GET /api/analytics/satisfaction-by-dimension?business=<pillar>
+Computed in: get_satisfaction_by_dimension_from_posts()
+
+Dimensions: distinct values found in `bug_categories` of the filtered posts,
+            normalized to title case (e.g. "Performance", "UI", "Pricing",
+            "Crashes"…). We keep the top N most frequent dimensions.
+
+For each (dimension, engine):
+    score      = mean satisfaction 0–10 of posts of that engine which contain
+                 that bug_category tag.
+    benchmark  = mean satisfaction across all engines for the same dimension.
+
+The frontend turns the Unity bar red when its score is below the per-dimension
+benchmark.
+
+Why a theme/bar can be empty:
+    - A theme had < MIN_POSTS_PER_DIMENSION (default 3) posts → it is skipped.
+    - An engine had no posts tagged with that theme → its bar for that theme
+      is null and not drawn.
+
+--------------------------------------------------------------------------------
+6. ENGAGEMENT & CHURN BY ENGINE   (horizontal bar chart)
+--------------------------------------------------------------------------------
+
+Endpoint:   GET /api/analytics/performance-gap?business=<pillar>
+Computed in: get_performance_gap_from_posts()
+
+For each engine the API returns two numbers:
+    iteration_time → renamed on the frontend to "Engagement index"
+                     = mean( interaction_score ) where interaction_score is
+                       a 0–100 figure produced by the analyzer (upvotes,
+                       comments, reactions normalized per platform).
+    build_size     → renamed on the frontend to "Churn pressure (avg. %)"
+                     = mean( churn_risk ) over the same filtered set.
+
+The legacy field names come from when this chart compared raw engine perf
+metrics (build size, iteration time). We kept them so older clients of the API
+don't break; the UI labels are the truthful ones.
+
+Why a bar can be 0 / missing:
+    - Engagement: posts in the filter have null `interaction_score`.
+    - Churn: posts in the filter have null `churn_risk` (older scraped data).
+
+--------------------------------------------------------------------------------
+7. SENTIMENT & NPS BY ENGINE   (bar chart with benchmark color)
+--------------------------------------------------------------------------------
+
+Endpoint:   GET /api/analytics/global-sentiment-nps?business=<pillar>
+Computed in: get_global_sentiment_nps_from_posts()
+
+Per-engine NPS approximation:
+    promoters_pct  = #posts with promoter_score ≥ 9    / #scored posts × 100
+    detractors_pct = #posts with detractor_score ≥ 6   / #scored posts × 100
+    nps_engine     = promoters_pct − detractors_pct       (range: −100 .. +100)
+
+benchmark_nps     = mean( nps_engine ) across the engines that have data.
+
+The frontend paints any engine bar red whose `nps < benchmark_nps`.
+
+Why a bar can be missing or read 0:
+    - The engine has fewer than MIN_POSTS_FOR_NPS (default 5) scored posts in
+      the filter → its NPS is null and it is not drawn.
+    - All scored posts of an engine sit between 6 and 8 (neither promoters
+      nor detractors) → NPS = 0, which is a valid value, not an error.
+
+--------------------------------------------------------------------------------
+8. WHY THE CHARTS MAY LOOK "EMPTY" RIGHT NOW
+--------------------------------------------------------------------------------
+
+In order of likelihood:
+
+1.  The selected pillar is filtering the input to a very small subset of posts.
+    "General" should always have the most volume; if you see real data in
+    General but empty charts under, say, "Finance", the database simply has
+    very few finance-tagged posts. This is a content problem, not a bug.
+
+2.  The scoring layer that populates `promoter_score`, `detractor_score`,
+    `churn_risk` and `interaction_score` hasn't run on the most recent batch.
+    KPIs 1.2–1.5 and charts 3, 4, 5, 6, 7 all rely on those fields. If the
+    scraped posts are recent but unscored, you will see correct volume
+    numbers (KPI 1.5 and chart 2) and empty everything else.
+
+3.  Time window. The default window is the last 90 days. If the scraper has
+    been paused for a while, all charts will look empty even on "General".
+
+4.  The minimum-sample thresholds (MIN_POSTS_FOR_SATISFACTION = 3,
+    MIN_POSTS_FOR_NPS = 5, MIN_POSTS_PER_DIMENSION = 3) deliberately hide
+    bars rather than draw a chart from 1 or 2 posts. This is intentional and
+    can be relaxed in `posts_aggregate.py` for a demo if needed.
+
+5.  The database is unreachable. In that case the page shows the amber
+    "Data temporarily unavailable" banner at the top and every chart shows
+    "Could not load…". This is the only case where the frontend is hiding
+    data that exists – the rest of the "empty" states are legitimate.
+
+--------------------------------------------------------------------------------
+9. HOW TO QUICKLY SANITY-CHECK THE NUMBERS BEFORE A DEMO
+--------------------------------------------------------------------------------
+
+Run, from the backend container/host:
+
+    curl 'http://localhost:8000/api/analytics/summary' | jq
+    curl 'http://localhost:8000/api/analytics/summary?business=Product' | jq
+
+If `summary` returns five items with non-null `value` and `change`, the page
+will render. If any chart looks empty, hit its endpoint directly:
+
+    /api/analytics/market-share-trend
+    /api/analytics/developer-satisfaction
+    /api/analytics/market-share-vs-developer-satisfaction
+    /api/analytics/satisfaction-by-dimension
+    /api/analytics/performance-gap
+    /api/analytics/global-sentiment-nps
+
+…and confirm whether the array is empty (database content issue) or non-empty
+(frontend issue, escalate).
+
+--------------------------------------------------------------------------------
+END OF DOCUMENT
+--------------------------------------------------------------------------------

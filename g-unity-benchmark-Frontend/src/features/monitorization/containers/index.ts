@@ -1,0 +1,1 @@
+export { MonitorizationContainer } from './MonitorizationContainer';

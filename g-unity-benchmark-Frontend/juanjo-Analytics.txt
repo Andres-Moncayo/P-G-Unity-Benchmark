@@ -1,0 +1,49 @@
+Resumen de cambios implementados en el frontend (Analytics)
+
+1. Nuevos gráficos y datos para Analytics
+   - Agregados los componentes:
+     - src/features/analytics/components/MarketShareSatisfactionScatter.tsx
+     - src/features/analytics/components/SatisfactionByDimensionChart.tsx
+   - Cada componente usa Recharts y sigue el estilo del proyecto.
+   - MarketShareSatisfactionScatter muestra un scatter plot de Market Share vs Developer Satisfaction.
+   - SatisfactionByDimensionChart muestra barras comparativas para Unity, Unreal y Godot.
+
+2. Soporte de datos y validación
+   - Creado el archivo de tipos y validación Zod:
+     - src/features/analytics/types/analyticsTypes.ts
+   - Creado el servicio de datos:
+     - src/features/analytics/services/analyticsService.ts
+   - Creado el hook de query:
+     - src/features/analytics/hooks/useAnalyticsData.ts
+   - Esto mantiene la arquitectura feature-first y usa TanStack Query.
+
+3. Integración para datos reales
+   - Quitado el plugin mock de Vite y la configuración local de endpoints:
+     - vite.config.ts
+   - Eliminados los datos de ejemplo de los componentes Analytics:
+     - src/features/analytics/components/AnalyticsDashboard.tsx
+     - src/features/analytics/components/MarketShareTrend.tsx
+     - src/features/analytics/components/DeveloperSatisfactionChart.tsx
+   - Estos componentes ahora esperan que el backend/IA conectado entregue datos reales.
+
+4. Ajuste del cliente API
+   - Actualizado src/services/apiClient.ts para usar:
+     - import.meta.env.VITE_API_BASE_URL ?? ''
+   - Esto permite apuntar al endpoint real cuando la IA/servicio esté disponible.
+
+5. Integración en el contenedor Analytics
+   - Actualizado src/features/analytics/analytics-container.tsx para mostrar:
+     - MarketShareTrend
+     - DeveloperSatisfactionChart
+     - MarketShareSatisfactionScatter
+     - SatisfactionByDimensionChart
+   - El componente UpdatePanel ya no se renderiza.
+
+6. Eliminación del panel de actualización
+   - Quité el botón "🔄 Actualizar datos".
+   - Quité el texto "Actualizado hace 2 min".
+   - Quité la notificación de campaña / badge rojo de la tarjeta de actualización.
+
+Notas:
+- Por ahora todo es frontend y mock data. El backend real se implementará en una etapa posterior.
+- El componente UpdatePanel existe todavía en el código, pero no se muestra en la pantalla Analytics.

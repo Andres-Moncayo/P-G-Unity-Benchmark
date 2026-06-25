@@ -1,0 +1,26 @@
+#!/bin/sh
+# Pre-push hook - Wrapper that calls PowerShell script on Windows
+# This ensures the hook works correctly on Windows systems
+
+if [ -n "$MSYSTEM" ] || [ -n "$SYSTEMROOT" ]; then
+  # Windows system detected - use PowerShell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(git rev-parse --git-dir)/hooks/pre-push.ps1"
+  exit $?
+else
+  # Unix-like system - use shell script
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  
+  if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║                          ERROR                              ║"
+    echo "╠════════════════════════════════════════════════════════════╣"
+    echo "║ No se permite hacer push directo a main/master.            ║"
+    echo "║ Por favor, crea una rama y haz un pull request.            ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1
+  fi
+  
+  exit 0
+fi

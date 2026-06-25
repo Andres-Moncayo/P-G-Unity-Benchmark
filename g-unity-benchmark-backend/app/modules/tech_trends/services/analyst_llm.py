@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import json
+from typing import Any, ClassVar, List
+
+from google import genai
+from google.genai import types
+from pydantic import ValidationError
+
+from app.modules.tech_trends.prompts import TECH_TRENDS_ANALYST_SYSTEM_PROMPT
+from app.modules.tech_trends.schemas import PostsHighlightsPayload
+
+
+class TechTrendsAnalystLLMService:
+    _response_cache: ClassVar[dict[str, list[dict[str, Any]]]] = {}
+    _cache_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+
+    def __init__(self, api_key: str, model: str = "gemma-4-31b-it") -> None:
+        self._client = genai.Client(api_key=api_key)
+        self._model = model
+
+    def _resolve_json_schema(self, model: type[PostsHighlightsPayload]) -> dict[str, Any]:
+        raw_schema = model.model_json_schema(ref_template="#/\$defs/{model}")
+        definitions = raw_schema.pop("\$defs", {})
+
+        def _resolve(node: Any) -> Any:
+            if isinstance(node, dict):
+                if "\$ref" in node:
+                    ref_name = str(node["\$ref"]).split("/")[-1]
+                    resolved = copy.deepcopy(definitions.get(ref_name, {}))
+                    if not resolved:
+                        return {}
+                    merged = {key: value for key, value in node.items() if key != "\$ref"}
+                    resolved.update(merged)
+                    return _resolve(resolved)
+
+                resolved_dict: dict[str, Any] = {}
+                for key, value in node.items():
+                    if key in {"title", "description", "examples"}:
+                        continue
+                    if key == "additionalProperties":
+                        continue
+                    resolved_dict[key] = _resolve(value)
+                return resolved_dict
+            if isinstance(node, list):
+                return [_resolve(item) for item in node]
+            return node
+
+        return _resolve(raw_schema)
+
+    def _compute_prompt_hash(self, context: str, schema: dict[str, Any]) -> str:
+        payload = {
+            "context": context.strip(),
+            "model": self._model,
+            "system_prompt": TECH_TRENDS_ANALYST_SYSTEM_PROMPT.strip(),
+            "schema": schema,
+        }
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    async def _get_cached_response(self, cache_key: str) -> list[dict[str, Any]] | None:
+        async with self._cache_lock:
+            cached = self._response_cache.get(cache_key)
+            if cached is None:
+                return None
+            return copy.deepcopy(cached)
+
+    async def _set_cached_response(self, cache_key: str, response: list[dict[str, Any]]) -> None:
+        async with self._cache_lock:
+            self._response_cache[cache_key] = copy.deepcopy(response)
+
+    def _build_prompt(self, context: str) -> str:
+        return (
+            "TASK: Analyze the following trend evidence and return strict flat JSON objects.\n\n"
+            f"CONTEXT:\n{context}\n\n"
+            "Return only valid JSON matching the schema."
+        )
+
+    def _parse_response(self, response: Any) -> PostsHighlightsPayload:
+        # 1. Intentar usar el parseo nativo del SDK si funcionó
+        try:
+            parsed = response.parsed
+            if isinstance(parsed, PostsHighlightsPayload):
+                return parsed
+            if parsed is not None:
+                return PostsHighlightsPayload.model_validate(parsed)
+        except (ValidationError, Exception):
+            pass
+
+        # 2. Si no, procesar el texto manualmente de forma defensiva
+        raw = getattr(response, "text", None)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("Gemini returned an invalid or empty response")
+
+        # Limpieza estricta de bloques markdown y texto sobrante
+        clean_raw = raw.strip()
+        if clean_raw.startswith("```json"):
+            clean_raw = clean_raw[7:]
+        elif clean_raw.startswith("```"):
+            clean_raw = clean_raw[3:]
+        if clean_raw.endswith("```"):
+            clean_raw = clean_raw[:-3]
+        
+        clean_raw = clean_raw.strip()
+
+        # Si el modelo mete texto explicativo antes o después del JSON, buscamos los límites reales
+        start_idx = clean_raw.find("{")
+        end_idx = clean_raw.rfind("}")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            clean_raw = clean_raw[start_idx:end_idx + 1]
+
+        payload = json.loads(clean_raw)
+        return PostsHighlightsPayload.model_validate(payload)
+
+    async def analyze(self, context: str) -> List[dict[str, Any]]:
+        # Mantenemos el esquema viejo para calcular el hash y no romper la cache existente
+        schema_for_cache = self._resolve_json_schema(PostsHighlightsPayload)
+        cache_key = self._compute_prompt_hash(context, schema_for_cache)
+
+        cached_response = await self._get_cached_response(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        prompt = self._build_prompt(context)
+        
+        # Enviamos la clase de Pydantic directamente al SDK de Google
+        config = types.GenerateContentConfig(
+            system_instruction=TECH_TRENDS_ANALYST_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=PostsHighlightsPayload,
+            temperature=0.2,
+        )
+        response = await self._client.aio.models.generate_content(
+            model=self._model,
+            contents=prompt,
+            config=config,
+        )
+
+        result = self._parse_response(response)
+        normalized = [post.model_dump(mode="json") for post in result.posts]
+        await self._set_cached_response(cache_key, normalized)
+        return normalized
